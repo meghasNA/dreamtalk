@@ -1,14 +1,14 @@
 import argparse
+import cv2
 import json
 import os
 
-import cv2
 import numpy as np
 import torch
 import torchvision
 import torchvision.transforms as transforms
 from PIL import Image
-
+import yaml
 
 def obtain_seq_index(index, num_frames, radius):
     seq = list(range(index - radius, index + radius + 1))
@@ -17,16 +17,23 @@ def obtain_seq_index(index, num_frames, radius):
 
 
 @torch.no_grad()
-def get_netG(checkpoint_path, device):
-    import yaml
-
+def get_netG(checkpoint_path):
     from generators.face_model import FaceGenerator
 
-    with open("generators/renderer_conf.yaml", "r") as f:
+    # Set up the base directory where the resources are located
+    base_dir = "/content/dreamtalk/"
+
+    # Construct the full path to the configuration file
+    config_path = os.path.join(base_dir, "generators/renderer_conf.yaml")
+
+    # Load the renderer configuration from the YAML file
+    with open(config_path, "r") as f:
         renderer_config = yaml.load(f, Loader=yaml.FullLoader)
 
-    renderer = FaceGenerator(**renderer_config).to(device)
+    # Initialize the FaceGenerator with the loaded configuration
+    renderer = FaceGenerator(**renderer_config).to(torch.cuda.current_device())
 
+    # Load the checkpoint for the FaceGenerator model
     checkpoint = torch.load(checkpoint_path, map_location=lambda storage, loc: storage)
     renderer.load_state_dict(checkpoint["net_G_ema"], strict=False)
 
@@ -42,7 +49,6 @@ def render_video(
     exp_path,
     wav_path,
     output_path,
-    device,
     silent=False,
     semantic_radius=13,
     fps=30,
@@ -97,8 +103,8 @@ def render_video(
     target_splited_exps = torch.split(target_exp_concat, split_size, dim=0)
     output_imgs = []
     for win_exp in target_splited_exps:
-        win_exp = win_exp.to(device)
-        cur_src_img = src_img.expand(win_exp.shape[0], -1, -1, -1).to(device)
+        win_exp = win_exp.cuda()
+        cur_src_img = src_img.expand(win_exp.shape[0], -1, -1, -1).cuda()
         output_dict = net_G(cur_src_img, win_exp)
         output_imgs.append(output_dict["fake_image"].cpu().clamp_(-1, 1))
 
