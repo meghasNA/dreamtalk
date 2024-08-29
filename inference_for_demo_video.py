@@ -1,30 +1,31 @@
 import argparse
+import torch
 import json
 import os
-import shutil
+
+from scipy.io import loadmat
 import subprocess
 
 import numpy as np
-import torch
 import torchaudio
-from scipy.io import loadmat
-from transformers import Wav2Vec2Processor
-from transformers.models.wav2vec2.modeling_wav2vec2 import Wav2Vec2Model
+import shutil
 
-from configs.default import get_cfg_defaults
-from core.networks.diffusion_net import DiffusionNet
-from core.networks.diffusion_util import NoisePredictor, VarianceSchedule
 from core.utils import (
-    crop_src_image,
     get_pose_params,
     get_video_style_clip,
     get_wav2vec_audio_window,
+    crop_src_image,
 )
+from configs.default import get_cfg_defaults
 from generators.utils import get_netG, render_video
+from core.networks.diffusion_net import DiffusionNet
+from core.networks.diffusion_util import NoisePredictor, VarianceSchedule
+from transformers import Wav2Vec2Processor
+from transformers.models.wav2vec2.modeling_wav2vec2 import Wav2Vec2Model
 
 
 @torch.no_grad()
-def get_diff_net(cfg, device):
+def get_diff_net(cfg):
     diff_net = DiffusionNet(
         cfg=cfg,
         net=NoisePredictor(cfg),
@@ -35,7 +36,7 @@ def get_diff_net(cfg, device):
             mode=cfg.DIFFUSION.SCHEDULE.MODE,
         ),
     )
-    checkpoint = torch.load(cfg.INFERENCE.CHECKPOINT, map_location=device)
+    checkpoint = torch.load(cfg.INFERENCE.CHECKPOINT)
     model_state_dict = checkpoint["model_state_dict"]
     diff_net_dict = {
         k[9:]: v for k, v in model_state_dict.items() if k[:9] == "diff_net."
@@ -44,14 +45,12 @@ def get_diff_net(cfg, device):
     diff_net.eval()
 
     return diff_net
-
-
+    
 @torch.no_grad()
 def get_audio_feat(wav_path, output_name, wav2vec_model):
     audio_feat_dir = os.path.dirname(audio_feat_path)
 
     pass
-
 
 @torch.no_grad()
 def inference_one_video(
@@ -61,7 +60,6 @@ def inference_one_video(
     pose_path,
     output_path,
     diff_net,
-    device,
     max_audio_len=None,
     sample_method="ddim",
     ddim_num_step=10,
@@ -79,7 +77,7 @@ def inference_one_video(
         win_size=cfg.WIN_SIZE,
     )
 
-    audio_win = torch.tensor(audio_win_array).to(device)
+    audio_win = torch.tensor(audio_win_array).cuda()
     audio = audio_win.unsqueeze(0)
 
     # the second parameter is "" because of bad interface design...
@@ -87,9 +85,9 @@ def inference_one_video(
         style_clip_path, "", style_max_len=256, start_idx=0
     )
 
-    style_clip = style_clip_raw.unsqueeze(0).to(device)
+    style_clip = style_clip_raw.unsqueeze(0).cuda()
     style_pad_mask = (
-        style_pad_mask_raw.unsqueeze(0).to(device)
+        style_pad_mask_raw.unsqueeze(0).cuda()
         if style_pad_mask_raw is not None
         else None
     )
@@ -122,7 +120,6 @@ def inference_one_video(
     np.save(output_path, gen_exp_pose)
     return output_path
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="inference for demo")
     parser.add_argument("--wav_path", type=str, default="", help="path for wav")
@@ -151,42 +148,37 @@ if __name__ == "__main__":
         type=str,
         default="test",
     )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda",
-    )
     args = parser.parse_args()
 
-    if args.device == "cuda" and not torch.cuda.is_available():
-        print("CUDA is not available, set --device=cpu to use CPU.")
-        exit(1)
-
-    device = torch.device(args.device)
-
+    # Base directory for dreamtalk resources
+    base_dir = "/content/dreamtalk/"
     cfg = get_cfg_defaults()
+    
+    # Set the checkpoint path before freezing the configuration
+    cfg.INFERENCE.CHECKPOINT = os.path.join(base_dir, "checkpoints/denoising_network.pth")
+
     cfg.CF_GUIDANCE.SCALE = args.cfg_scale
     cfg.freeze()
-
-    tmp_dir = f"tmp/{args.output_name}"
+    # Adjust directories to use base path
+    tmp_dir = os.path.join(base_dir, f"tmp/{args.output_name}")
     os.makedirs(tmp_dir, exist_ok=True)
 
     # get audio in 16000Hz
     wav_16k_path = os.path.join(tmp_dir, f"{args.output_name}_16K.wav")
-    command = f"ffmpeg -y -i {args.wav_path} -async 1 -ac 1 -vn -acodec pcm_s16le -ar 16000 {wav_16k_path}"
+    command = f"ffmpeg -y -i {os.path.join(base_dir, args.wav_path)} -async 1 -ac 1 -vn -acodec pcm_s16le -ar 16000 {wav_16k_path}"
     subprocess.run(command.split())
 
-    # get wav2vec feat from audio
+    # Load wav2vec features and model
     wav2vec_processor = Wav2Vec2Processor.from_pretrained(
         "jonatasgrosman/wav2vec2-large-xlsr-53-english"
     )
-
     wav2vec_model = (
         Wav2Vec2Model.from_pretrained("jonatasgrosman/wav2vec2-large-xlsr-53-english")
         .eval()
-        .to(device)
+        .cuda()
     )
 
+    # Load and process the audio
     speech_array, sampling_rate = torchaudio.load(wav_16k_path)
     audio_data = speech_array.squeeze().numpy()
     inputs = wav2vec_processor(
@@ -194,9 +186,7 @@ if __name__ == "__main__":
     )
 
     with torch.no_grad():
-        audio_embedding = wav2vec_model(
-            inputs.input_values.to(device), return_dict=False
-        )[0]
+        audio_embedding = wav2vec_model(inputs.input_values.cuda(), return_dict=False)[0]
 
     audio_feat_path = os.path.join(tmp_dir, f"{args.output_name}_wav2vec.npy")
     np.save(audio_feat_path, audio_embedding[0].cpu().numpy())
@@ -204,45 +194,36 @@ if __name__ == "__main__":
     # get src image
     src_img_path = os.path.join(tmp_dir, "src_img.png")
     if args.img_crop:
-        crop_src_image(args.image_path, src_img_path, 0.4)
+        crop_src_image(os.path.join(base_dir, args.image_path), src_img_path, 0.4)
     else:
-        shutil.copy(args.image_path, src_img_path)
+        shutil.copy(os.path.join(base_dir, args.image_path), src_img_path)
 
     with torch.no_grad():
-        # get diff model and load checkpoint
-        diff_net = get_diff_net(cfg, device).to(device)
+        # Load and configure diffusion model
+        diff_net = get_diff_net(cfg).cuda()
+
         # generate face motion
         face_motion_path = os.path.join(tmp_dir, f"{args.output_name}_facemotion.npy")
         inference_one_video(
             cfg,
             audio_feat_path,
-            args.style_clip_path,
-            args.pose_path,
+            os.path.join(base_dir, args.style_clip_path),
+            os.path.join(base_dir, args.pose_path),
             face_motion_path,
             diff_net,
-            device,
             max_audio_len=args.max_gen_len,
         )
-        # get renderer
-        renderer = get_netG("checkpoints/renderer.pt", device)
-        # render video
-        output_video_path = f"output_video/{args.output_name}.mp4"
+        # Setup renderer and render the video
+        renderer = get_netG(os.path.join(base_dir, "checkpoints/renderer.pt"))
+        output_video_path = os.path.join(base_dir, f"output_video/{args.output_name}.mp4")
         render_video(
             renderer,
             src_img_path,
             face_motion_path,
             wav_16k_path,
             output_video_path,
-            device,
             fps=25,
             no_move=False,
         )
 
-        # add watermark
-        # if you want to generate videos with no watermark (for evaluation), remove this code block.
-        no_watermark_video_path = f"{output_video_path}-no_watermark.mp4"
-        shutil.move(output_video_path, no_watermark_video_path)
-        os.system(
-            f'ffmpeg -y -i {no_watermark_video_path} -vf  "movie=media/watermark.png,scale= 120: 36[watermask]; [in] [watermask] overlay=140:220 [out]" {output_video_path}'
-        )
-        os.remove(no_watermark_video_path)
+        # Optional: Watermarking or other post-processing can be added here if needed.
